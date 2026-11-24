@@ -1,8 +1,9 @@
-# Sony LUT Studio V0.3
+# Sony LUT Studio V0.3.1
 
 V0.3 builds on the V0.2 Liquid Glass interface and adds:
 - Import of `.cube` 3D LUT files through Android Storage Access Framework.
 - Import of JPEG images through Android Storage Access Framework.
+- More robust image loading: reads the selected URI once into a temporary cache file, with a file-descriptor fallback for document providers that do not reliably expose input streams.
 - 3D LUT application using tetrahedral interpolation.
 - Original and processed preview display.
 

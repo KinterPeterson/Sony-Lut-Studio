@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -40,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -316,24 +318,68 @@ private fun GlassPanel(content: @Composable ColumnScope.() -> Unit) {
 
 private fun decodePreviewBitmap(context: Context, uri: Uri): Bitmap {
     val resolver = context.contentResolver
-    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        ?: throw IllegalArgumentException("无法打开照片文件。")
-    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-        throw IllegalArgumentException("无法识别照片尺寸或文件格式。")
-    }
+    // Some document providers do not reliably reopen the same URI stream.
+    // Copy the selected image once to the app cache, then decode that local file.
+    val cachedPhoto = File.createTempFile("lut_preview_", ".img", context.cacheDir)
+    try {
+        var copied = false
+        var streamError: Exception? = null
 
-    val maxDimension = 2048
-    var sample = 1
-    while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxDimension) {
-        sample *= 2
+        try {
+            val input = resolver.openInputStream(uri)
+            if (input != null) {
+                input.use { source ->
+                    cachedPhoto.outputStream().buffered().use { target -> source.copyTo(target) }
+                }
+                copied = cachedPhoto.length() > 0L
+            }
+        } catch (e: Exception) {
+            streamError = e
+        }
+
+        // Fallback for providers that expose a file descriptor but return a null
+        // or unusable InputStream from openInputStream().
+        if (!copied) {
+            try {
+                val descriptor = resolver.openFileDescriptor(uri, "r")
+                if (descriptor != null) {
+                    ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { source ->
+                        cachedPhoto.outputStream().buffered().use { target -> source.copyTo(target) }
+                    }
+                    copied = cachedPhoto.length() > 0L
+                }
+            } catch (e: Exception) {
+                if (streamError == null) streamError = e
+            }
+        }
+
+        if (!copied) {
+            val detail = streamError?.message?.takeIf { it.isNotBlank() }
+            throw IllegalArgumentException(
+                if (detail != null) "系统文件提供器无法读取照片：$detail" else "系统文件提供器没有返回照片数据，请尝试从手机本地文件夹重新选择。"
+            )
+        }
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(cachedPhoto.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw IllegalArgumentException("无法识别照片尺寸或文件格式，请选择 JPEG 图片。")
+        }
+
+        val maxDimension = 2048
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxDimension) {
+            sample *= 2
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        return BitmapFactory.decodeFile(cachedPhoto.absolutePath, options)
+            ?: throw IllegalArgumentException("照片数据已读取，但 Android 无法解码该图片格式。")
+    } finally {
+        cachedPhoto.delete()
     }
-    val options = BitmapFactory.Options().apply {
-        inSampleSize = sample
-        inPreferredConfig = Bitmap.Config.ARGB_8888
-    }
-    return resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
-        ?: throw IllegalArgumentException("照片解码失败。")
 }
 
 private fun displayName(context: Context, uri: Uri): String {
