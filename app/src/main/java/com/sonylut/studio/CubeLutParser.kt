@@ -11,7 +11,7 @@ data class CubeLutInfo(
     val domainMin: List<Float>,
     val domainMax: List<Float>,
     val dataCount: Int,
-    // RGB triplets in the original .cube file order; retained for the image-processing stage.
+    // .cube RGB triplets, with red varying fastest, then green, then blue.
     val rgbValues: FloatArray
 )
 
@@ -36,7 +36,8 @@ object CubeLutParser {
                 if (line.isEmpty()) return@forEach
                 val p = line.split(Regex("\\s+"))
                 when (p[0].uppercase(Locale.US)) {
-                    "TITLE" -> title = line.substringAfter("TITLE").trim().removeSurrounding("\"").ifBlank { "Untitled LUT" }
+                    "TITLE" -> title = line.substringAfter("TITLE").trim()
+                        .removeSurrounding("\"").ifBlank { "Untitled LUT" }
                     "LUT_1D_SIZE" -> throw CubeLutParseException("第 $lineNo 行：本版本暂不支持一维 LUT。")
                     "LUT_3D_SIZE" -> {
                         if (size != null || p.size != 2) throw CubeLutParseException("第 $lineNo 行：LUT_3D_SIZE 格式错误或重复。")

@@ -1,12 +1,22 @@
-# Sony LUT Studio V0.2
+# Sony LUT Studio V0.3
 
-V0.2 adds Android Storage Access Framework import and validation for `.cube` 3D LUT files.
+V0.3 builds on the V0.2 Liquid Glass interface and adds:
+- Import of `.cube` 3D LUT files through Android Storage Access Framework.
+- Import of JPEG images through Android Storage Access Framework.
+- 3D LUT application using tetrahedral interpolation.
+- Original and processed preview display.
 
-- Reads TITLE, LUT_3D_SIZE, DOMAIN_MIN and DOMAIN_MAX
-- Supports 3D LUT sizes 2–64
-- Validates RGB triplet rows and exact N³ data count
-- Minimum Android API 29; JDK 17; AGP 8.7.3; Gradle 8.9
+## Important scope
+- Preview decoding is downsampled so the longest side is at most approximately 2048 px.
+- This version does not export the full-resolution JPEG.
+- Full-resolution tiled processing and JPEG export are planned for a later version.
+- 1D LUT files are not supported.
+- A LUT must match the input image's color encoding. Do not assume an S-Log3 LUT is suitable for every Sony JPEG.
 
-Build with `gradle assembleDebug`.
-
-This version imports and validates LUT files only. JPEG import, LUT application and export are later milestones.
+## Build
+- Android Gradle Plugin 8.7.3
+- Gradle 8.9
+- Kotlin 2.0.21
+- JDK 17
+- Compile SDK 35
+- Minimum SDK 29
