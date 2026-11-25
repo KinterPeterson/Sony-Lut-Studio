@@ -2,19 +2,20 @@ package com.sonylut.studio
 
 import android.graphics.Bitmap
 import kotlin.math.floor
-import kotlin.math.max
-import kotlin.math.min
 
 /**
  * Applies a 3D .cube LUT with tetrahedral interpolation.
  * LUT storage follows the common .cube order: red changes fastest.
  */
 object TetrahedralLutProcessor {
-    fun apply(source: Bitmap, lut: CubeLutInfo): Bitmap {
+    fun apply(source: Bitmap, lut: CubeLutInfo, intensity: Float = 1f): Bitmap {
         val width = source.width
         val height = source.height
         val pixels = IntArray(width * height)
         source.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val amount = intensity.coerceIn(0f, 1f)
+        if (amount <= 0f) return source.copy(Bitmap.Config.ARGB_8888, false)
 
         val n = lut.size
         val maxIndex = n - 1
@@ -33,17 +34,23 @@ object TetrahedralLutProcessor {
             val mappedB = ((b - dMin[2]) / (dMax[2] - dMin[2])).coerceIn(0f, 1f) * maxIndex
 
             val out = interpolate(mappedR, mappedG, mappedB, n, output)
+            val rr = mix(r, out[0], amount)
+            val gg = mix(g, out[1], amount)
+            val bb = mix(b, out[2], amount)
             val a = (color ushr 24) and 0xFF
-            val rr = (out[0].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
-            val gg = (out[1].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
-            val bb = (out[2].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
-            pixels[i] = (a shl 24) or (rr shl 16) or (gg shl 8) or bb
+            val ri = (rr * 255f + 0.5f).toInt().coerceIn(0, 255)
+            val gi = (gg * 255f + 0.5f).toInt().coerceIn(0, 255)
+            val bi = (bb * 255f + 0.5f).toInt().coerceIn(0, 255)
+            pixels[i] = (a shl 24) or (ri shl 16) or (gi shl 8) or bi
         }
 
         return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
             it.setPixels(pixels, 0, width, 0, 0, width, height)
         }
     }
+
+    private fun mix(original: Float, transformed: Float, amount: Float): Float =
+        (original + (transformed - original) * amount).coerceIn(0f, 1f)
 
     private fun interpolate(r: Float, g: Float, b: Float, n: Int, data: FloatArray): FloatArray {
         val r0 = floor(r).toInt().coerceIn(0, n - 2)
