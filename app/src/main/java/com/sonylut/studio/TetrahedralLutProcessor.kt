@@ -6,15 +6,22 @@ import kotlin.math.floor
 /**
  * Applies a 3D .cube LUT with tetrahedral interpolation.
  * LUT storage follows the common .cube order: red changes fastest.
+ *
+ * [intensity] is expressed as a 0..2 multiplier: 1f = 100% full LUT,
+ * 2f = 200% pushed/extrapolated look. Values above 1 extrapolate away
+ * from the original pixel toward (and beyond) the LUT result; final
+ * channels are clamped back to the valid 0..1 range.
  */
 object TetrahedralLutProcessor {
+    const val MAX_INTENSITY = 2f
+
     fun apply(source: Bitmap, lut: CubeLutInfo, intensity: Float = 1f): Bitmap {
         val width = source.width
         val height = source.height
         val pixels = IntArray(width * height)
         source.getPixels(pixels, 0, width, 0, 0, width, height)
 
-        val amount = intensity.coerceIn(0f, 1f)
+        val amount = intensity.coerceIn(0f, MAX_INTENSITY)
         if (amount <= 0f) return source.copy(Bitmap.Config.ARGB_8888, false)
 
         val n = lut.size
