@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.ColorSpace
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -36,6 +37,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -64,6 +66,8 @@ private const val KEY_ENTRIES = "lut_entries"
 private const val KEY_PRESETS = "presets"
 private const val KEY_CATEGORIES = "custom_categories"
 private const val KEY_EXPORT_HISTORY = "export_history"
+private const val KEY_EXPORT_FORMAT = "export_format"
+private const val KEY_JPEG_QUALITY = "jpeg_quality"
 
 private val BUILT_INS = listOf(
     "CV-Arri-IceBlue.cube",
@@ -126,6 +130,8 @@ private fun StudioScreen() {
     var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var intensity by remember { mutableFloatStateOf(prefs.getFloat(KEY_INTENSITY, 100f).coerceIn(0f, 200f)) }
+    var exportFormat by remember { mutableStateOf(prefs.getString(KEY_EXPORT_FORMAT, "png16") ?: "png16") }
+    var jpegQuality by remember { mutableIntStateOf(prefs.getInt(KEY_JPEG_QUALITY, 98).coerceIn(95, 100)) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("请先在设置中指定照片读取目录和输出目录。") }
@@ -332,36 +338,53 @@ private fun StudioScreen() {
                 val folder = DocumentFile.fromTreeUri(context, outputUri)
                     ?: throw IllegalStateException("输出目录授权已失效，请重新设置。")
                 if (!folder.canWrite()) throw IllegalStateException("输出目录不可写，请重新授权。")
-                status = "正在解码原始照片…"
+                val format = exportFormat
+                val quality = jpegQuality
+                val extension = if (format == "png16") "png" else "jpg"
+                val mimeType = if (format == "png16") "image/png" else "image/jpeg"
+                status = "正在解码原始照片（sRGB 工作空间）…"
                 full = withContext(Dispatchers.IO) { decodeFullResolutionBitmap(sourceFile) }
-                status = "正在以原始分辨率逐行应用 LUT…"
                 val activeLut = lut
                 val activeIntensity = intensity / 100f
-                result = withContext(Dispatchers.Default) {
-                    val job = coroutineContext[Job]
-                    TetrahedralLutProcessor.apply(full!!, activeLut, activeIntensity) { row, total ->
-                        if (row % 32 == 0 || row == total) job?.ensureActive()
-                    }
-                }
-                val bitmap = result ?: throw IllegalStateException("处理结果为空。")
                 val base = photoFileName.substringBeforeLast('.', photoFileName).ifBlank { "SonyLUTStudio" }
                 val lutSlug = sanitizeName(lutFileName.substringBeforeLast('.').substringAfter("·").trim().ifBlank { "LUT" })
-                val finalName = uniqueDocumentName(folder, "${sanitizeName(base)}_${lutSlug}", "jpg")
+                val finalName = uniqueDocumentName(folder, "${sanitizeName(base)}_${lutSlug}", extension)
                 val tempName = ".sony_lut_${System.currentTimeMillis()}.partial"
-                temporary = folder.createFile("image/jpeg", tempName)
+                temporary = folder.createFile(mimeType, tempName)
                     ?: throw IllegalStateException("无法在输出目录创建临时文件。")
-                status = "正在写入 JPEG（质量 98）…"
-                withContext(Dispatchers.IO) {
-                    context.contentResolver.openOutputStream(temporary!!.uri, "w")?.use { out ->
-                        if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)) {
-                            throw IllegalStateException("JPEG 编码失败。")
+                if (format == "png16") {
+                    status = "正在执行 Float32 LUT 处理并写入 16-bit PNG…"
+                    withContext(Dispatchers.Default) {
+                        val job = coroutineContext[Job]
+                        context.contentResolver.openOutputStream(temporary!!.uri, "w")?.use { out ->
+                            TetrahedralLutProcessor.writePng16(full!!, activeLut, activeIntensity, out) { row, total ->
+                                if (row % 32 == 0 || row == total) job?.ensureActive()
+                            }
+                            out.flush()
+                        } ?: throw IllegalStateException("无法写入 PNG 文件。")
+                    }
+                } else {
+                    status = "正在执行 Float32 LUT 处理…"
+                    result = withContext(Dispatchers.Default) {
+                        val job = coroutineContext[Job]
+                        TetrahedralLutProcessor.apply(full!!, activeLut, activeIntensity) { row, total ->
+                            if (row % 32 == 0 || row == total) job?.ensureActive()
                         }
-                        out.flush()
-                    } ?: throw IllegalStateException("无法写入输出文件。")
+                    }
+                    val bitmap = result ?: throw IllegalStateException("处理结果为空。")
+                    status = "正在写入 JPEG（质量 $quality）…"
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(temporary!!.uri, "w")?.use { out ->
+                            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)) {
+                                throw IllegalStateException("JPEG 编码失败。")
+                            }
+                            out.flush()
+                        } ?: throw IllegalStateException("无法写入输出文件。")
+                    }
                 }
                 var exportedUri: Uri? = null
                 if (!temporary!!.renameTo(finalName)) {
-                    val finalFile = folder.createFile("image/jpeg", finalName)
+                    val finalFile = folder.createFile(mimeType, finalName)
                         ?: throw IllegalStateException("无法创建最终照片文件。")
                     withContext(Dispatchers.IO) {
                         context.contentResolver.openInputStream(temporary!!.uri)?.use { input ->
@@ -382,7 +405,7 @@ private fun StudioScreen() {
                         .distinctBy { it.uri }.take(10)
                     saveExportHistory(prefs, exportHistory)
                 }
-                status = "导出完成：$finalName · ${bitmap.width} × ${bitmap.height} px"
+                status = "导出完成：$finalName · ${full!!.width} × ${full!!.height} px · ${if (format == "png16") "16-bit PNG 无损" else "JPEG 质量 $quality"}"
             } catch (e: Exception) {
                 status = e.message ?: "导出失败。"
                 error = true
@@ -422,14 +445,17 @@ private fun StudioScreen() {
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(shape = RoundedCornerShape(18.dp), color = Color.White.copy(alpha = .12f), modifier = Modifier.size(52.dp)) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(Icons.Rounded.ColorLens, null, tint = Color(0xFFB9D9FF), modifier = Modifier.size(29.dp))
-                    }
+                Surface(shape = RoundedCornerShape(16.dp), color = Color(0xFF07142B), modifier = Modifier.size(54.dp)) {
+                    ComposeImage(
+                        painter = painterResource(id = com.sonylut.studio.R.drawable.app_logo),
+                        contentDescription = "Sony LUT Studio Logo",
+                        modifier = Modifier.fillMaxSize().padding(2.dp),
+                        contentScale = ContentScale.Fit
+                    )
                 }
                 Column(Modifier.weight(1f).padding(start = 13.dp)) {
                     Text("Sony LUT Studio", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                    Text("V0.6 · Photo Workflow & LUT Manager", color = Color(0xFFB6C5D8), fontSize = 12.sp)
+                    Text("V0.7 · High Fidelity Color Engine", color = Color(0xFFB6C5D8), fontSize = 12.sp)
                 }
                 IconButton(onClick = { showSettings = true }) {
                     Icon(Icons.Rounded.Settings, "设置", tint = Color(0xFFB9D9FF))
@@ -552,7 +578,7 @@ private fun StudioScreen() {
                         colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color(0xFF102039)),
                         shape = RoundedCornerShape(16.dp)
                     ) { Icon(Icons.Rounded.SaveAlt, null); Text("  一键导出到指定文件夹", fontWeight = FontWeight.SemiBold) }
-                    Text("重新读取原始照片，以原始分辨率处理并保存 JPEG（质量 98）。", color = Muted, fontSize = 11.sp)
+                    Text(if (exportFormat == "png16") "原始分辨率 · Float32 处理 · 16-bit PNG 无损导出。" else "原始分辨率 · Float32 处理 · JPEG 质量 $jpegQuality。", color = Muted, fontSize = 11.sp)
                 }
             }
 
@@ -574,7 +600,7 @@ private fun StudioScreen() {
                     LinearProgressIndicator(Modifier.fillMaxWidth(), color = Accent, trackColor = Color.White.copy(alpha = .12f))
                 }
                 Spacer(Modifier.height(8.dp))
-                Text("V0.6：内置照片浏览器、自动导出、LUT 收藏与分类、调色预设和状态记忆。", color = Color(0xFFCBD7E6), fontSize = 12.sp, lineHeight = 19.sp)
+                Text("V0.7：Float32 色彩处理、16-bit PNG 无损导出与 JPEG 质量控制；完整保留 V0.6 照片和 LUT 工作流。", color = Color(0xFFCBD7E6), fontSize = 12.sp, lineHeight = 19.sp)
             }
             Text("SONY LUT STUDIO · COLOR WORKFLOW", color = Color(0xFF8295AD), fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
         }
@@ -588,6 +614,10 @@ private fun StudioScreen() {
             onChooseOutput = { outputFolderPicker.launch(null) },
             onClose = { showSettings = false },
             recentExports = exportHistory,
+            exportFormat = exportFormat,
+            jpegQuality = jpegQuality,
+            onExportFormatChange = { exportFormat = it; prefs.edit().putString(KEY_EXPORT_FORMAT, it).apply() },
+            onJpegQualityChange = { jpegQuality = it; prefs.edit().putInt(KEY_JPEG_QUALITY, it).apply() },
             onOpenExport = { openExport(context, it) }
         )
     }
@@ -701,6 +731,10 @@ private fun SettingsDialog(
     onChooseOutput: () -> Unit,
     onClose: () -> Unit,
     recentExports: List<ExportRecord>,
+    exportFormat: String,
+    jpegQuality: Int,
+    onExportFormatChange: (String) -> Unit,
+    onJpegQualityChange: (Int) -> Unit,
     onOpenExport: (ExportRecord) -> Unit
 ) {
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -721,15 +755,24 @@ private fun SettingsDialog(
                     GlassButton("指定输出文件夹", Icons.Rounded.Folder, true, onChooseOutput)
                 }
                 GlassPanel {
-                    Text("导出设置", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                    Text("画质与导出", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("JPEG 导出质量", color = Color.White)
-                            Text("固定为 98，保持 V0.5 的导出质量", color = Muted, fontSize = 11.sp)
-                        }
-                        Text("98", color = Accent, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Text("导出格式", color = Muted, fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = exportFormat == "png16", onClick = { onExportFormatChange("png16") }, label = { Text("16-bit PNG") })
+                        FilterChip(selected = exportFormat == "jpeg", onClick = { onExportFormatChange("jpeg") }, label = { Text("JPEG") })
                     }
+                    Text("16-bit PNG：RGB 每通道 16 位、无损压缩；JPEG：兼容性更好，但仍为有损格式。当前源图解码为 8-bit，不能恢复源文件已丢失的信息。", color = Muted, fontSize = 11.sp, lineHeight = 17.sp)
+                    if (exportFormat == "jpeg") {
+                        Spacer(Modifier.height(8.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("JPEG 质量", color = Color.White)
+                            Text("$jpegQuality", color = Accent, fontWeight = FontWeight.Bold)
+                        }
+                        Slider(value = jpegQuality.toFloat(), onValueChange = { onJpegQualityChange(it.toInt().coerceIn(95, 100)) }, valueRange = 95f..100f, steps = 4)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("处理核心：Float32 RGB · 逐行低内存处理 · sRGB 输出标记", color = Muted, fontSize = 11.sp)
                 }
                 GlassPanel {
                     Text("最近导出", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
@@ -751,8 +794,8 @@ private fun SettingsDialog(
                 }
                 GlassPanel {
                     Text("关于", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                    Text("Sony LUT Studio · Version 0.6 (7)", color = Muted, fontSize = 13.sp)
-                    Text("深蓝 Liquid Glass 界面 · 3D LUT 四面体插值", color = Muted, fontSize = 12.sp)
+                    Text("Sony LUT Studio · Version 0.7 (8)", color = Muted, fontSize = 13.sp)
+                    Text("Float32 色彩处理 · 16-bit PNG · 3D LUT 四面体插值", color = Muted, fontSize = 12.sp)
                 }
             }
         }
@@ -1390,13 +1433,13 @@ private fun decodePreviewBitmap(file: File): Bitmap {
     var sample = 1
     while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 2048) sample *= 2
     val decoded = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply {
-        inSampleSize = sample; inPreferredConfig = Bitmap.Config.ARGB_8888
+        inSampleSize = sample; inPreferredConfig = Bitmap.Config.ARGB_8888; inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.SRGB)
     }) ?: throw IllegalArgumentException("Android 无法解码该图片。")
     return applyExifOrientation(file, decoded)
 }
 
 private fun decodeFullResolutionBitmap(file: File): Bitmap {
-    val decoded = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 })
+    val decoded = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888; inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.SRGB) })
         ?: throw IllegalArgumentException("无法解码原始照片。")
     return applyExifOrientation(file, decoded)
 }
