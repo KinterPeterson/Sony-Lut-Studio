@@ -4,55 +4,60 @@ import android.graphics.Bitmap
 import kotlin.math.floor
 
 /**
- * Applies a 3D .cube LUT with tetrahedral interpolation.
- * LUT storage follows the common .cube order: red changes fastest.
+ * 3D .cube LUT processing with tetrahedral interpolation.
+ * Processes one scanline at a time to avoid allocating a full-image pixel array.
  */
 object TetrahedralLutProcessor {
-    fun apply(source: Bitmap, lut: CubeLutInfo, intensity: Float = 1f): Bitmap {
+
+    fun apply(
+        source: Bitmap,
+        lut: CubeLutInfo,
+        intensity: Float = 1f,
+        onRowProcessed: ((Int, Int) -> Unit)? = null
+    ): Bitmap {
         val width = source.width
         val height = source.height
-        val pixels = IntArray(width * height)
-        source.getPixels(pixels, 0, width, 0, 0, width, height)
-
-        val amount = intensity.coerceIn(0f, 1f)
-        if (amount <= 0f) return source.copy(Bitmap.Config.ARGB_8888, false)
-
+        val outputBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val row = IntArray(width)
+        val mapped = FloatArray(3)
+        val amount = intensity.coerceIn(0f, 2f)
         val n = lut.size
         val maxIndex = n - 1
-        val output = lut.rgbValues
+        val data = lut.rgbValues
         val dMin = lut.domainMin
         val dMax = lut.domainMax
 
-        for (i in pixels.indices) {
-            val color = pixels[i]
-            val r = ((color ushr 16) and 0xFF) / 255f
-            val g = ((color ushr 8) and 0xFF) / 255f
-            val b = (color and 0xFF) / 255f
+        for (y in 0 until height) {
+            source.getPixels(row, 0, width, 0, y, width, 1)
+            for (x in 0 until width) {
+                val color = row[x]
+                val r = ((color ushr 16) and 0xFF) / 255f
+                val g = ((color ushr 8) and 0xFF) / 255f
+                val b = (color and 0xFF) / 255f
 
-            val mappedR = ((r - dMin[0]) / (dMax[0] - dMin[0])).coerceIn(0f, 1f) * maxIndex
-            val mappedG = ((g - dMin[1]) / (dMax[1] - dMin[1])).coerceIn(0f, 1f) * maxIndex
-            val mappedB = ((b - dMin[2]) / (dMax[2] - dMin[2])).coerceIn(0f, 1f) * maxIndex
+                val mr = ((r - dMin[0]) / (dMax[0] - dMin[0])).coerceIn(0f, 1f) * maxIndex
+                val mg = ((g - dMin[1]) / (dMax[1] - dMin[1])).coerceIn(0f, 1f) * maxIndex
+                val mb = ((b - dMin[2]) / (dMax[2] - dMin[2])).coerceIn(0f, 1f) * maxIndex
+                interpolate(mr, mg, mb, n, data, mapped)
 
-            val out = interpolate(mappedR, mappedG, mappedB, n, output)
-            val rr = mix(r, out[0], amount)
-            val gg = mix(g, out[1], amount)
-            val bb = mix(b, out[2], amount)
-            val a = (color ushr 24) and 0xFF
-            val ri = (rr * 255f + 0.5f).toInt().coerceIn(0, 255)
-            val gi = (gg * 255f + 0.5f).toInt().coerceIn(0, 255)
-            val bi = (bb * 255f + 0.5f).toInt().coerceIn(0, 255)
-            pixels[i] = (a shl 24) or (ri shl 16) or (gi shl 8) or bi
+                val rr = (r + (mapped[0] - r) * amount).coerceIn(0f, 1f)
+                val gg = (g + (mapped[1] - g) * amount).coerceIn(0f, 1f)
+                val bb = (b + (mapped[2] - b) * amount).coerceIn(0f, 1f)
+                val a = (color ushr 24) and 0xFF
+                row[x] = (a shl 24) or
+                    (((rr * 255f + 0.5f).toInt().coerceIn(0, 255)) shl 16) or
+                    (((gg * 255f + 0.5f).toInt().coerceIn(0, 255)) shl 8) or
+                    ((bb * 255f + 0.5f).toInt().coerceIn(0, 255))
+            }
+            outputBitmap.setPixels(row, 0, width, 0, y, width, 1)
+            onRowProcessed?.invoke(y + 1, height)
         }
-
-        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-            it.setPixels(pixels, 0, width, 0, 0, width, height)
-        }
+        return outputBitmap
     }
 
-    private fun mix(original: Float, transformed: Float, amount: Float): Float =
-        (original + (transformed - original) * amount).coerceIn(0f, 1f)
-
-    private fun interpolate(r: Float, g: Float, b: Float, n: Int, data: FloatArray): FloatArray {
+    private fun interpolate(
+        r: Float, g: Float, b: Float, n: Int, data: FloatArray, out: FloatArray
+    ) {
         val r0 = floor(r).toInt().coerceIn(0, n - 2)
         val g0 = floor(g).toInt().coerceIn(0, n - 2)
         val b0 = floor(b).toInt().coerceIn(0, n - 2)
@@ -60,54 +65,48 @@ object TetrahedralLutProcessor {
         val fg = (g - g0).coerceIn(0f, 1f)
         val fb = (b - b0).coerceIn(0f, 1f)
 
-        fun sample(ri: Int, gi: Int, bi: Int): FloatArray {
-            val index = ((bi * n + gi) * n + ri) * 3
-            return floatArrayOf(data[index], data[index + 1], data[index + 2])
-        }
-        fun blend(c0: FloatArray, c1: FloatArray, w1: Float,
-                  c2: FloatArray, w2: Float, c3: FloatArray, w3: Float): FloatArray {
-            return FloatArray(3) { channel ->
-                c0[channel] +
-                    w1 * (c1[channel] - c0[channel]) +
-                    w2 * (c2[channel] - c1[channel]) +
-                    w3 * (c3[channel] - c2[channel])
-            }
-        }
+        fun index(ri: Int, gi: Int, bi: Int) = ((bi * n + gi) * n + ri) * 3
+        val i000 = index(r0, g0, b0)
+        val i111 = index(r0 + 1, g0 + 1, b0 + 1)
 
-        val c000 = sample(r0, g0, b0)
-        val c111 = sample(r0 + 1, g0 + 1, b0 + 1)
-
-        return when {
+        // Tetrahedral interpolation expressed as weighted edge differences.
+        var i1: Int
+        var i2: Int
+        var w1: Float
+        var w2: Float
+        var w3: Float
+        when {
             fr >= fg && fg >= fb -> {
-                val c100 = sample(r0 + 1, g0, b0)
-                val c110 = sample(r0 + 1, g0 + 1, b0)
-                blend(c000, c100, fr, c110, fg, c111, fb)
+                i1 = index(r0 + 1, g0, b0); i2 = index(r0 + 1, g0 + 1, b0)
+                w1 = fr; w2 = fg; w3 = fb
             }
             fr >= fb && fb > fg -> {
-                val c100 = sample(r0 + 1, g0, b0)
-                val c101 = sample(r0 + 1, g0, b0 + 1)
-                blend(c000, c100, fr, c101, fb, c111, fg)
+                i1 = index(r0 + 1, g0, b0); i2 = index(r0 + 1, g0, b0 + 1)
+                w1 = fr; w2 = fb; w3 = fg
             }
             fb > fr && fr >= fg -> {
-                val c001 = sample(r0, g0, b0 + 1)
-                val c101 = sample(r0 + 1, g0, b0 + 1)
-                blend(c000, c001, fb, c101, fr, c111, fg)
+                i1 = index(r0, g0, b0 + 1); i2 = index(r0 + 1, g0, b0 + 1)
+                w1 = fb; w2 = fr; w3 = fg
             }
             fg > fr && fr >= fb -> {
-                val c010 = sample(r0, g0 + 1, b0)
-                val c110 = sample(r0 + 1, g0 + 1, b0)
-                blend(c000, c010, fg, c110, fr, c111, fb)
+                i1 = index(r0, g0 + 1, b0); i2 = index(r0 + 1, g0 + 1, b0)
+                w1 = fg; w2 = fr; w3 = fb
             }
             fg >= fb && fb > fr -> {
-                val c010 = sample(r0, g0 + 1, b0)
-                val c011 = sample(r0, g0 + 1, b0 + 1)
-                blend(c000, c010, fg, c011, fb, c111, fr)
+                i1 = index(r0, g0 + 1, b0); i2 = index(r0, g0 + 1, b0 + 1)
+                w1 = fg; w2 = fb; w3 = fr
             }
             else -> {
-                val c001 = sample(r0, g0, b0 + 1)
-                val c011 = sample(r0, g0 + 1, b0 + 1)
-                blend(c000, c001, fb, c011, fg, c111, fr)
+                i1 = index(r0, g0, b0 + 1); i2 = index(r0, g0 + 1, b0 + 1)
+                w1 = fb; w2 = fg; w3 = fr
             }
+        }
+        for (c in 0..2) {
+            val c0 = data[i000 + c]
+            val c1 = data[i1 + c]
+            val c2 = data[i2 + c]
+            val c3 = data[i111 + c]
+            out[c] = c0 + w1 * (c1 - c0) + w2 * (c2 - c1) + w3 * (c3 - c2)
         }
     }
 }

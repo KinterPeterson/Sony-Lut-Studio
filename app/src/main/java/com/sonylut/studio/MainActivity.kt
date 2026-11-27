@@ -3,8 +3,10 @@ package com.sonylut.studio
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
+import androidx.exifinterface.media.ExifInterface
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
@@ -42,6 +44,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -68,29 +72,78 @@ private fun StudioScreen() {
     var lutIntensity by remember { mutableFloatStateOf(100f) }
     var comparingOriginal by remember { mutableStateOf(false) }
     var processingJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    var exportBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var sourcePhotoFile by remember { mutableStateOf<File?>(null) }
+    var exportSourceFile by remember { mutableStateOf<File?>(null) }
+    var exportLut by remember { mutableStateOf<CubeLutInfo?>(null) }
+    var exportIntensity by remember { mutableFloatStateOf(1f) }
+    var builtInMenuExpanded by remember { mutableStateOf(false) }
 
     val exportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
-        val bitmap = exportBitmap
-        if (uri != null && bitmap != null) scope.launch {
+        val sourceFile = exportSourceFile
+        val lut = exportLut
+        if (uri != null && sourceFile != null && lut != null) scope.launch {
             loading = true
             error = false
-            status = "正在导出 JPEG…"
+            status = "正在解码原始照片并校正 EXIF 方向…"
+            var fullBitmap: Bitmap? = null
+            var resultBitmap: Bitmap? = null
             try {
                 withContext(Dispatchers.IO) {
+                    fullBitmap = decodeFullResolutionBitmap(sourceFile)
+                }
+                val source = fullBitmap ?: throw IllegalStateException("原始照片解码失败。")
+                status = "正在以原始分辨率逐行应用 LUT…"
+                resultBitmap = withContext(Dispatchers.Default) {
+                    val job = coroutineContext[kotlinx.coroutines.Job]
+                    TetrahedralLutProcessor.apply(source, lut, exportIntensity) { row, total ->
+                        if (row % 32 == 0 || row == total) job?.ensureActive()
+                    }
+                }
+                val output = resultBitmap ?: throw IllegalStateException("LUT 处理失败。")
+                status = "正在写入 JPEG（质量 98）…"
+                withContext(Dispatchers.IO) {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
-                        if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)) {
+                        if (!output.compress(Bitmap.CompressFormat.JPEG, 98, out)) {
                             throw IllegalStateException("JPEG 编码失败。")
                         }
                     } ?: throw IllegalStateException("无法创建导出文件。")
                 }
-                status = "导出完成 · JPEG 质量 95"
+                status = "导出完成 · ${output.width} × ${output.height} px · JPEG 质量 98"
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 status = e.message ?: "照片导出失败。"
                 error = true
             } finally {
+                fullBitmap?.recycle()
+                resultBitmap?.recycle()
                 loading = false
-                exportBitmap = null
+                exportSourceFile = null
+                exportLut = null
+            }
+        }
+    }
+
+    fun loadBuiltInLut(assetName: String) {
+        if (loading) return
+        scope.launch {
+            loading = true
+            error = false
+            status = "正在载入内置 LUT…"
+            try {
+                val parsed = withContext(Dispatchers.IO) {
+                    context.assets.open("luts/$assetName").use { CubeLutParser.parse(it) }
+                }
+                lutInfo = parsed
+                lutFileName = "内置 · $assetName"
+                processedBitmap = null
+                lutIntensity = 100f
+                status = "内置 LUT 载入成功：${parsed.title}"
+            } catch (e: Exception) {
+                status = e.message ?: "内置 LUT 载入失败。"
+                error = true
+            } finally {
+                loading = false
             }
         }
     }
@@ -125,12 +178,16 @@ private fun StudioScreen() {
             loading = true
             error = false
             processedBitmap = null
-            status = "正在读取照片…"
+            status = "正在读取照片并校正 EXIF 方向…"
             try {
-                val decoded = withContext(Dispatchers.IO) { decodePreviewBitmap(context, uri) }
+                val cached = withContext(Dispatchers.IO) { copyUriToCache(context, uri) }
+                val decoded = withContext(Dispatchers.IO) { decodePreviewBitmap(cached) }
+                sourcePhotoFile?.delete()
+                sourcePhotoFile = cached
+                originalBitmap?.recycle()
                 originalBitmap = decoded
                 photoFileName = displayName(context, uri)
-                status = "照片已载入（预览最长边不超过 2048 px）"
+                status = "照片已载入 · EXIF 方向已校正 · 预览最长边不超过 2048 px"
             } catch (e: Exception) {
                 status = e.message ?: "照片读取失败。"
                 error = true
@@ -151,7 +208,10 @@ private fun StudioScreen() {
             status = "正在进行四面体插值…"
             try {
                 val result = withContext(Dispatchers.Default) {
-                    TetrahedralLutProcessor.apply(source, lut, lutIntensity / 100f)
+                    val job = coroutineContext[kotlinx.coroutines.Job]
+                    TetrahedralLutProcessor.apply(source, lut, lutIntensity / 100f) { row, total ->
+                        if (row % 32 == 0 || row == total) job?.ensureActive()
+                    }
                 }
                 processedBitmap = result
                 status = "处理完成 · LUT 强度 ${lutIntensity.toInt()}% · ${result.width} × ${result.height}"
@@ -189,7 +249,7 @@ private fun StudioScreen() {
                 }
                 Column(Modifier.padding(start = 14.dp)) {
                     Text("Sony LUT Studio", color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.Bold)
-                    Text("V0.4 · 交互式 LUT 调色工作台", color = Color(0xFFB6C5D8), fontSize = 13.sp)
+                    Text("V0.5 · 交互式 LUT 调色工作台", color = Color(0xFFB6C5D8), fontSize = 13.sp)
                 }
             }
 
@@ -212,6 +272,36 @@ private fun StudioScreen() {
                 Spacer(Modifier.height(14.dp))
                 GlassButton("导入 .cube LUT", Icons.Rounded.Add, enabled = !loading) {
                     lutPicker.launch(arrayOf("*/*"))
+                }
+                Spacer(Modifier.height(8.dp))
+                Box {
+                    OutlinedButton(
+                        onClick = { builtInMenuExpanded = true },
+                        enabled = !loading,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFB9D9FF))
+                    ) { Text("选择内置 Arri LUT") }
+                    DropdownMenu(
+                        expanded = builtInMenuExpanded,
+                        onDismissRequest = { builtInMenuExpanded = false }
+                    ) {
+                        listOf(
+                            "CV-Arri-IceBlue.cube",
+                            "CV-Arri-Jamaica.cube",
+                            "CV-Arri-Neutral.cube",
+                            "CV-Arri-Tungsten.cube",
+                            "CV-Arri-Utopia.cube"
+                        ).forEach { asset ->
+                            DropdownMenuItem(
+                                text = { Text(asset.removePrefix("CV-Arri-").removeSuffix(".cube")) },
+                                onClick = {
+                                    builtInMenuExpanded = false
+                                    loadBuiltInLut(asset)
+                                }
+                            )
+                        }
+                    }
                 }
             }
 
@@ -252,7 +342,7 @@ private fun StudioScreen() {
                         value = lutIntensity,
                         onValueChange = { value -> lutIntensity = value },
                         onValueChangeFinished = { if (lutInfo != null && originalBitmap != null) applyLut() },
-                        valueRange = 0f..100f,
+                        valueRange = 0f..200f,
                         enabled = !loading && lutInfo != null,
                         colors = SliderDefaults.colors(
                             thumbColor = Color(0xFFB9D9FF),
@@ -262,7 +352,7 @@ private fun StudioScreen() {
                     )
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text("原图 0%", color = Color(0xFF9FB9D5), fontSize = 11.sp)
-                        Text("完全应用 100%", color = Color(0xFF9FB9D5), fontSize = 11.sp)
+                        Text("增强效果 200%", color = Color(0xFF9FB9D5), fontSize = 11.sp)
                     }
                     Spacer(Modifier.height(8.dp))
                     Button(
@@ -319,8 +409,17 @@ private fun StudioScreen() {
                         Spacer(Modifier.height(10.dp))
                         Button(
                             onClick = {
-                                exportBitmap = it
-                                exportPicker.launch("SonyLUTStudio_${System.currentTimeMillis()}.jpg")
+                                val file = sourcePhotoFile
+                                val lut = lutInfo
+                                if (file != null && lut != null) {
+                                    exportSourceFile = file
+                                    exportLut = lut
+                                    exportIntensity = lutIntensity / 100f
+                                    exportPicker.launch("SonyLUTStudio_${System.currentTimeMillis()}.jpg")
+                                } else {
+                                    status = "找不到原始照片缓存，请重新导入照片。"
+                                    error = true
+                                }
                             },
                             enabled = !loading,
                             modifier = Modifier.fillMaxWidth(),
@@ -333,7 +432,7 @@ private fun StudioScreen() {
                             Icon(Icons.Rounded.CheckCircle, null)
                             Text("  导出处理后的 JPEG", fontWeight = FontWeight.SemiBold)
                         }
-                        Text("当前导出的是 2048 px 以内的预览图，并非原始全分辨率照片。", color = Color(0xFF9FB9D5), fontSize = 11.sp)
+                        Text("导出将重新读取原始照片，以原始分辨率处理并保存 JPEG（质量 98）。", color = Color(0xFF9FB9D5), fontSize = 11.sp)
                     }
                 }
             }
@@ -355,7 +454,7 @@ private fun StudioScreen() {
                 }
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    "V0.4 新增 LUT 强度调节、按住对比原图及 JPEG 预览导出。照片仍以最长边不超过 2048 px 的预览尺寸处理；原始分辨率分块处理将在后续版本完善。 ",
+                    "V0.5 支持 5 款内置 Arri LUT、0–200% 强度、EXIF 方向校正及原始分辨率 JPEG 导出。处理按行执行以降低像素缓存开销。",
                     color = Color(0xFFCBD7E6), fontSize = 12.sp, lineHeight = 19.sp
                 )
             }
@@ -411,70 +510,100 @@ private fun GlassPanel(content: @Composable ColumnScope.() -> Unit) {
     }
 }
 
-private fun decodePreviewBitmap(context: Context, uri: Uri): Bitmap {
-    val resolver = context.contentResolver
-    // Some document providers do not reliably reopen the same URI stream.
-    // Copy the selected image once to the app cache, then decode that local file.
-    val cachedPhoto = File.createTempFile("lut_preview_", ".img", context.cacheDir)
+private fun copyUriToCache(context: Context, uri: Uri): File {
+    val cached = File.createTempFile("sony_lut_source_", ".img", context.cacheDir)
+    var copied = false
+    var streamError: Exception? = null
     try {
-        var copied = false
-        var streamError: Exception? = null
-
         try {
-            val input = resolver.openInputStream(uri)
-            if (input != null) {
-                input.use { source ->
-                    cachedPhoto.outputStream().buffered().use { target -> source.copyTo(target) }
-                }
-                copied = cachedPhoto.length() > 0L
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                cached.outputStream().buffered().use { output -> input.copyTo(output) }
+                copied = cached.length() > 0L
             }
         } catch (e: Exception) {
             streamError = e
         }
-
-        // Fallback for providers that expose a file descriptor but return a null
-        // or unusable InputStream from openInputStream().
         if (!copied) {
             try {
-                val descriptor = resolver.openFileDescriptor(uri, "r")
+                val descriptor = context.contentResolver.openFileDescriptor(uri, "r")
                 if (descriptor != null) {
-                    ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { source ->
-                        cachedPhoto.outputStream().buffered().use { target -> source.copyTo(target) }
+                    ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
+                        cached.outputStream().buffered().use { output -> input.copyTo(output) }
                     }
-                    copied = cachedPhoto.length() > 0L
+                    copied = cached.length() > 0L
                 }
             } catch (e: Exception) {
                 if (streamError == null) streamError = e
             }
         }
-
         if (!copied) {
-            val detail = streamError?.message?.takeIf { it.isNotBlank() }
             throw IllegalArgumentException(
-                if (detail != null) "系统文件提供器无法读取照片：$detail" else "系统文件提供器没有返回照片数据，请尝试从手机本地文件夹重新选择。"
+                streamError?.message?.let { "系统文件提供器无法读取照片：$it" }
+                    ?: "系统文件提供器没有返回照片数据，请尝试从手机本地文件夹重新选择。"
             )
         }
+        return cached
+    } catch (e: Exception) {
+        cached.delete()
+        throw e
+    }
+}
 
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(cachedPhoto.absolutePath, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            throw IllegalArgumentException("无法识别照片尺寸或文件格式，请选择 JPEG 图片。")
-        }
-
-        val maxDimension = 2048
-        var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxDimension) {
-            sample *= 2
-        }
-        val options = BitmapFactory.Options().apply {
+private fun decodePreviewBitmap(file: File): Bitmap {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+        throw IllegalArgumentException("无法识别照片尺寸或文件格式，请选择 JPEG 图片。")
+    }
+    var sample = 1
+    while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 2048) sample *= 2
+    val decoded = BitmapFactory.decodeFile(
+        file.absolutePath,
+        BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        return BitmapFactory.decodeFile(cachedPhoto.absolutePath, options)
-            ?: throw IllegalArgumentException("照片数据已读取，但 Android 无法解码该图片格式。")
-    } finally {
-        cachedPhoto.delete()
+    ) ?: throw IllegalArgumentException("Android 无法解码该图片格式。")
+    return applyExifOrientation(file, decoded)
+}
+
+private fun decodeFullResolutionBitmap(file: File): Bitmap {
+    val decoded = BitmapFactory.decodeFile(
+        file.absolutePath,
+        BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+    ) ?: throw IllegalArgumentException("无法解码原始照片。")
+    return applyExifOrientation(file, decoded)
+}
+
+/** Applies all eight EXIF orientation cases and returns pixels in display orientation. */
+private fun applyExifOrientation(file: File, bitmap: Bitmap): Bitmap {
+    val orientation = try {
+        ExifInterface(file.absolutePath).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL
+        )
+    } catch (_: Exception) {
+        ExifInterface.ORIENTATION_NORMAL
     }
+    if (orientation == ExifInterface.ORIENTATION_NORMAL ||
+        orientation == ExifInterface.ORIENTATION_UNDEFINED) return bitmap
+
+    val w = bitmap.width.toFloat()
+    val h = bitmap.height.toFloat()
+    val values = when (orientation) {
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> floatArrayOf(-1f, 0f, w, 0f, 1f, 0f, 0f, 0f, 1f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> floatArrayOf(-1f, 0f, w, 0f, -1f, h, 0f, 0f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> floatArrayOf(1f, 0f, 0f, 0f, -1f, h, 0f, 0f, 1f)
+        ExifInterface.ORIENTATION_TRANSPOSE -> floatArrayOf(0f, 1f, 0f, 1f, 0f, 0f, 0f, 0f, 1f)
+        ExifInterface.ORIENTATION_ROTATE_90 -> floatArrayOf(0f, -1f, h, 1f, 0f, 0f, 0f, 0f, 1f)
+        ExifInterface.ORIENTATION_TRANSVERSE -> floatArrayOf(0f, -1f, h, -1f, 0f, w, 0f, 0f, 1f)
+        ExifInterface.ORIENTATION_ROTATE_270 -> floatArrayOf(0f, 1f, 0f, -1f, 0f, w, 0f, 0f, 1f)
+        else -> return bitmap
+    }
+    val matrix = Matrix().apply { setValues(values) }
+    val corrected = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    if (corrected !== bitmap) bitmap.recycle()
+    return corrected
 }
 
 private fun displayName(context: Context, uri: Uri): String {
